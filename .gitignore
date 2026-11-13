@@ -1,0 +1,31 @@
+# data, generated tables, caches, models, logs — never commit patient-level material
+Data/**
+!Data/README.md
+!Data/**/.gitkeep
+Baseline_ML_Models_v2/abalation_study_v2/data/
+Baseline_ML_Models_v2/abalation_study_v2/results/
+Baseline_ML_Models_v2/abalation_study_v2/exp_*/data/
+Baseline_ML_Models_v2/abalation_study_v2/exp_*/results/
+Baseline_ML_Models_v2/abalation_study_v2/exp_*/figures/
+Baseline_ML_Models_v2/abalation_study_v2/exp_*/models/
+Baseline_ML_Models_v2/abalation_study_v2/exp_5_ablation/work/
+Baseline_ML_Models_v2/abalation_study_v2/paper_materials/cohort/
+Baseline_ML_Models_v2/abalation_study_v2/paper_materials/figures/
+Baseline_ML_Models_v2/abalation_study_v2/paper_materials/interpretability/
+Baseline_ML_Models_v2/Deep_Learning_Models/results/
+Baseline_ML_Models_v2/Machine_Clinical_Models/results/
+Baseline_ML_Models_v2/Clinical_Only_Models/results/
+*.joblib
+*.pt
+*.pth
+*.npz
+*.parquet
+*.pkl
+*.log
+# the paper PDF is copyrighted by IEEE; link to it instead of committing it
+*.pdf
+# python / jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env

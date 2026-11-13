@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper below."
+title: "CRRT Rolling-Based Mortality Prediction"
+type: software
+authors:
+  - family-names: Pranto
+    given-names: Shehan Irteza
+preferred-citation:
+  type: conference-paper
+  title: "Rolling Day-Wise Mortality Prediction in Critically Ill Patients With AKI on CRRT Utilizing Machine Pressure Waveforms"
+  authors:
+    - family-names: Pranto
+      given-names: Shehan Irteza
+    - family-names: Yang
+      given-names: Joanna
+    - family-names: Lambert
+      given-names: Joshua
+    - family-names: Goldstein
+      given-names: Stuart L.
+    - family-names: Chan
+      given-names: Lili
+    - family-names: Nadkarni
+      given-names: Girish N.
+    - family-names: Colicchio
+      given-names: Tiago K.
+    - family-names: Neyra
+      given-names: Javier A.
+    - family-names: Chen
+      given-names: Jin
+  collection-title: "Proceedings of the IEEE International Conference on Big Data (IEEE BigData)"
+  year: 2026

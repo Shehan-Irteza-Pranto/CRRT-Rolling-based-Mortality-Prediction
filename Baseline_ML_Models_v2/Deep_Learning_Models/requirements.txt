@@ -1,0 +1,18 @@
+# Deep Learning half — extends the classical requirements (../requirements.txt).
+# None of the torch stack is installed in this environment yet; install before running
+# anything under models/ training/ interpretability/.
+
+torch>=2.1.0
+# data prep + metrics (framework-free) only need the classical stack:
+numpy>=1.23.0
+pandas>=1.5.0
+scikit-learn>=1.3.0
+matplotlib>=3.6.0
+seaborn>=0.12.0
+
+# interpretability
+captum>=0.7.0          # Integrated Gradients / DeepLift for CNN & RNN
+shap>=0.42.0           # DeepSHAP (shared with classical pipeline)
+
+# optional rung 4b — frozen MOMENT embeddings
+# momentfm>=0.1.0      # uncomment if the MOMENT rung is included

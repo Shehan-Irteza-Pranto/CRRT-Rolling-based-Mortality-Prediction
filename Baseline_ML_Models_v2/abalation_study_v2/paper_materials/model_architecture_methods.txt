@@ -1,0 +1,314 @@
+================================================================================
+PROPOSED MODEL — DETAILED ARCHITECTURE DESCRIPTION FOR THE METHODS SECTION
+Combined ensemble: a Transformer-Fusion deep network + top-k classical base
+learners, combined by a logistic-regression stacking meta-learner.
+Task: 1-day CRRT circuit-day mortality. Held-out test AUROC = 0.738.
+(Matches the block diagram, panels A-D.)
+
+Source of truth (implementation):
+  - Deep network branches ....... exp_4/hp_search_transformer.py  (class TFusion)
+  - Transformer encoder ......... Deep_Learning_Models/models/transformer.py
+                                  (SinusoidalPE, TransformerEncoderModel)
+  - Sequence encoder factory .... Deep_Learning_Models/models/fusion.py
+                                  (build_seq_encoder, _TransformerEncodeWrapper)
+  - Window reduction ............ models/dl_reduce.py (window_aggregate, k=10)
+  - Gap-aware signal ............ exp_3/features/day_signal.py (load_raw_days)
+  - Classical learners + mRMR ... exp_3/results/combined_fusion_ensemble.py
+                                  (_classical_probs), models/feature_select.py
+                                  (select_columns/mrmr_select), models/classical.py
+  - Stacking + selection ........ exp_4/stack_with_tuned_transformer.py
+================================================================================
+
+PREDICTION TARGET
+For each CRRT circuit-day d we output one probability P(death). The 1-day label
+y in {0,1} is 1 if the patient dies on day d+2 (with a 1-day blanking gap: day
+d+1 is excluded from training/eval), and 0 otherwise. A "circuit-day" is one
+(patient, treatment-episode, day) unit.
+
+--------------------------------------------------------------------------------
+NOTATION
+--------------------------------------------------------------------------------
+  sigma(.)     logistic sigmoid, sigma(z) = 1 / (1 + e^{-z})
+  [a ; b]      vector concatenation
+  W, b         learnable weight matrix / bias
+  d = 64       transformer / hidden width (CF.CH = 64 in code)
+  x_seq        machine sequence tensor, shape [144, 30]
+  m            window validity mask, shape [144], m_i in {0,1}
+  x_clin       clinical feature vector for the DL branch, shape [40]
+  x_tab        grouped-mRMR tabular vector for the classical learners, shape [60]
+  P_DL         probability from the Transformer-Fusion deep network (panel B)
+  P_1..P_K     probabilities from the classical base learners (panel C)
+  P_stack      final probability from the stacking meta-learner (panel D)
+
+
+================================================================================
+A. INPUT REPRESENTATIONS — TWO VIEWS OF EACH TREATMENT DAY
+================================================================================
+DESCRIPTION.
+Each CRRT circuit-day begins as a denoised per-minute pressure signal on a fixed
+1440-minute grid with 6 channels: the four measured pressures (ACCESS, FILTER,
+EFFLUENT, RETURN) and two physiology-derived channels,
+      TMP = (FILTER + RETURN)/2 - EFFLUENT     (transmembrane pressure)
+      PFD = FILTER - RETURN                     (pressure drop across the filter).
+Before the grid is formed, the raw stream is gap-aware reconstructed
+(exp_3/features/day_signal.py, load_raw_days): missing runs <= 10 min are linearly
+interpolated and marked valid; runs > 10 min and the leading/trailing empty
+minutes are left missing and marked invalid via the per-minute mask. From this the
+model derives two "views" of the day (panel A) plus a tabular view for panel C.
+
+--------------------------------------------------------------------------------
+A.1  MACHINE SEQUENCE VIEW  (down-sampling -> x_seq in R^{144 x 30})
+--------------------------------------------------------------------------------
+DESCRIPTION.
+Full-length self-attention over 1440 minutes is costly and noisy, so the day is
+DOWN-SAMPLED into W = 144 non-overlapping 10-minute windows
+(models/dl_reduce.py, window_aggregate with k=10). For each window i and each of
+the 6 channels, five summary statistics are computed OVER THE VALID MINUTES ONLY:
+mean, min, max, standard deviation, and the least-squares slope (a local trend).
+Stacking 5 statistics x 6 channels yields a 30-dimensional token per window. This
+converts one day into a short 144-step sequence of 30-d tokens that a small
+transformer can model efficiently while preserving within-window trend and
+dispersion information.
+
+EQUATIONS.
+      x_i = [ stat_s(channel_c) : c = 1..6, s in {mean,min,max,std,slope} ] in R^30
+      x_seq = [ x_1, x_2, ..., x_144 ]                         (shape [144, 30])
+
+Each channel is z-scored with TRAIN-set mean/std computed over valid minutes (the
+same statistics are reused for validation/test — no leakage). A window with no
+valid minutes has m_i = 0 (masked out of attention); otherwise m_i = 1.
+
+--------------------------------------------------------------------------------
+A.2  CLINICAL VECTOR VIEW  (x_clin in R^{40}; feeds the DL clinical branch)
+--------------------------------------------------------------------------------
+DESCRIPTION.
+The patient's clinical features (labs, comorbidities, CRRT indications, diagnoses,
+demographics, severity such as APACHE-II) are median-imputed and standardized on
+TRAIN, then reduced by mRMR (minimum-Redundancy Maximum-Relevance) to the top-40
+features (models/feature_select.py, fit on TRAIN only). This compact vector is the
+input to the clinical MLP branch (panel B.2).
+
+      x_clin = [ f_1, ..., f_40 ]
+
+--------------------------------------------------------------------------------
+A.3  GROUPED-mRMR TABULAR VIEW  (x_tab in R^{60}; feeds panel C)
+--------------------------------------------------------------------------------
+DESCRIPTION.
+The classical base learners use a tabular fusion of the 200 engineered machine
+features (per-day distribution + dynamics + circuit-instability features) and the
+clinical features. After median imputation + standardization (fit on TRAIN),
+GROUPED mRMR is applied (models/feature_select.py, select_columns with
+feature_set="combined"): machine and clinical columns are separated by their
+name prefix (abl_config.is_machine_col), mRMR is run WITHIN each group, and the
+top-20 machine + top-40 clinical features are concatenated.
+
+      x_tab = [ machine_1..20 ; clinical_1..40 ] in R^60
+
+
+================================================================================
+B. TRANSFORMER-FUSION DEEP NETWORK  (class TFusion -> output P_DL)
+================================================================================
+DESCRIPTION.
+A two-branch, late-fusion neural network (exp_4/hp_search_transformer.py, class
+TFusion). One branch encodes the machine sequence x_seq with a Transformer
+encoder; the other encodes the clinical vector x_clin with a small MLP. The two
+64-d branch embeddings are concatenated and passed through a fusion head that
+outputs a single logit -> probability P_DL. "Late fusion" (concatenating branch
+embeddings rather than mixing raw inputs) keeps each modality's inductive bias
+intact. Tuned configuration (selected by validation AUROC over a 12-point search
+in hp_search_transformer.py::CONFIGS): width d = 64, ONE encoder layer, h = 4
+attention heads, feed-forward width 128, dropout p = 0.4, weight decay 5e-3,
+learning rate 3e-4.
+
+--------------------------------------------------------------------------------
+B.1  MACHINE BRANCH — TRANSFORMER ENCODER
+     (Deep_Learning_Models/models/transformer.py, TransformerEncoderModel)
+--------------------------------------------------------------------------------
+DESCRIPTION.
+The 144-step, 30-d sequence is encoded by a standard Transformer encoder used in
+"encode" mode (build_seq_encoder("transformer", ...) wraps it via
+_TransformerEncodeWrapper so it returns the pooled [CLS] embedding). Steps:
+
+(1) TOKEN (PATCH) EMBEDDING. A single linear layer projects each 30-d window token
+    to the model width d = 64 (transformer.py: self.proj = nn.Linear(in_ch, d)).
+
+        z_i = W_in x_i + b_in ,   W_in in R^{64 x 30},   i = 1..144
+
+(2) LEARNABLE [CLS] TOKEN. A learnable vector (initialized to zeros,
+    nn.Parameter) is prepended to the sequence; after encoding, its final state
+    serves as the whole-day summary (a BERT-style pooling token).
+
+        Z^(0) = [ z_CLS ; z_1 ; ... ; z_144 ]              (shape [145, 64])
+
+(3) SINUSOIDAL POSITIONAL ENCODING. Fixed (non-learned) sinusoidal encodings
+    (transformer.py: class SinusoidalPE) are added so the encoder knows window
+    order (pos = 0 for CLS, 1..144 for windows; j indexes the 64 dimensions):
+
+        PE(pos, 2j)   = sin( pos / 10000^{2j/d} )
+        PE(pos, 2j+1) = cos( pos / 10000^{2j/d} )
+        Z^(0) <- Z^(0) + PE
+
+(4) ENCODER LAYER (x n_layers = 1). Implemented with nn.TransformerEncoderLayer
+    (batch_first, activation="gelu", default POST-layer-norm). A key-padding mask
+    excludes masked/gap windows from attention; the [CLS] token is always attended.
+    In code the mask is built as pad = ~m (True where invalid) and a False column
+    is prepended for CLS.
+
+    (a) MULTI-HEAD SELF-ATTENTION (h = 4 heads, per-head dim d_k = d/h = 16). Each
+        window attends to every other VALID window, letting the model relate, e.g.,
+        an early-day pressure pattern to an end-of-day deterioration:
+
+        Q = Z W_Q,  K = Z W_K,  V = Z W_V
+        head_r = softmax( (Q_r K_r^T)/sqrt(d_k) + M ) V_r ,   r = 1..h
+                 (M_ij = -inf if window j is masked, else 0)
+        MHSA(Z) = [ head_1 ; ... ; head_h ] W_O
+        Z' = LayerNorm( Z + MHSA(Z) )                        (residual + post-norm)
+
+    (b) POSITION-WISE FEED-FORWARD NETWORK (64 -> 128 -> 64, GELU, with dropout
+        inside the block):
+
+        FFN(z) = W_2 * GELU( W_1 z + b_1 ) + b_2 ,  W_1 in R^{128x64}, W_2 in R^{64x128}
+        Z'' = LayerNorm( Z' + FFN(Z') )                      (residual + post-norm)
+
+    Dropout (p = 0.4) is applied on the attention weights and inside the FFN.
+
+(5) POOLING. The final state of the [CLS] token is taken as the 64-d machine-day
+    embedding (transformer.py: encode() returns h[:, 0]).
+
+        e_mach = Z''[CLS] in R^64
+
+--------------------------------------------------------------------------------
+B.2  CLINICAL BRANCH — MLP
+     (TFusion.clin = Linear -> BatchNorm1d -> ReLU -> Dropout)
+--------------------------------------------------------------------------------
+DESCRIPTION.
+The 40-d clinical vector is mapped to a 64-d embedding by a single fully-connected
+block with batch normalization, ReLU non-linearity, and dropout for regularization.
+
+        e_clin = Dropout( ReLU( BatchNorm( W_c x_clin + b_c ) ) ) ,  W_c in R^{64 x 40}
+        e_clin in R^64                                             (dropout p = 0.4)
+
+--------------------------------------------------------------------------------
+B.3  FUSION & HEAD  (TFusion.head; late fusion by concatenation)
+--------------------------------------------------------------------------------
+DESCRIPTION.
+The machine and clinical embeddings are concatenated into a 128-d vector and passed
+through a two-layer MLP head: a 128->64 hidden layer with ReLU + dropout, then a
+64->1 output layer producing the logit, squeezed and passed through a sigmoid.
+
+        u    = [ e_mach ; e_clin ] in R^128                  (concatenate, 64 + 64)
+        g    = Dropout( ReLU( W_h1 u + b_h1 ) ) ,  W_h1 in R^{64 x 128}
+        z_DL = W_h2 g + b_h2 ,                      W_h2 in R^{1 x 64}   (logit)
+        P_DL = sigma( z_DL )                                 (deep-network probability)
+
+
+================================================================================
+C. CLASSICAL BASE LEARNERS  (exp_3/results/combined_fusion_ensemble.py,
+   _classical_probs -> outputs P_1, ..., P_K)
+================================================================================
+DESCRIPTION.
+In parallel with the deep network, a pool of tabular models is trained on the
+grouped-mRMR vector x_tab (R^60). The preprocessing exactly mirrors the deep
+branch's clinical handling but is fit on the combined table: median imputation
+(SimpleImputer) fit on TRAIN, then standardization (StandardScaler) fit on TRAIN,
+then grouped mRMR (20 machine + 40 clinical). Five model families are considered:
+
+        Gradient Boosting (GB), Random Forest (RF), LightGBM, XGBoost,
+        Logistic Regression (LogReg).
+
+TUNING & MULTI-SEED. Each family is hyperparameter-tuned by RandomizedSearchCV
+with StratifiedKFold cross-validation on TRAIN, scoring by AUROC
+(models/classical.py, RANDOMIZED_SEARCH_ITER iterations, CV_FOLDS folds). The
+tuned estimator is then refit over 5 random seeds and its per-day probabilities
+averaged across seeds (combined_fusion_ensemble.py::_multiseed_probs) to remove
+single-seed variance. Each family thus emits a validation- and test-probability:
+
+        P_k = f_k( x_tab ) ,   k over the tuned families.
+
+SELECTION. The families are RANKED BY VALIDATION AUROC and the TOP-3 classical
+models are carried forward into the stack (K = 3 in the reported model). Tree
+ensembles optimize their own criteria (log-loss for GB/boosting and LogReg, Gini
+impurity for RF), so there is no single closed-form objective across the pool.
+
+
+================================================================================
+D. STACKING META-LEARNER — LOGISTIC REGRESSION
+   (exp_4/stack_with_tuned_transformer.py -> output P_stack)
+================================================================================
+DESCRIPTION.
+The deep-network probability (FORCED into the stack) and the top-3 classical
+probabilities are treated as new "meta-features." A logistic-regression
+meta-learner (sklearn LogisticRegression, max_iter=5000) learns how to weight the
+four base learners. Crucially, the meta-learner is FIT ON THE VALIDATION SET —
+using the base learners' VALIDATION-set probabilities and the true validation
+labels — never on the test set, so the stacking weights cannot leak test
+information. This "stacked generalization" lets a strong classical member and the
+complementary deep network be combined optimally.
+
+EQUATIONS.
+        phi     = [ P_DL, P_1, P_2, P_3 ] in R^4             (meta-feature vector)
+        P_stack = sigma( sum_{j=1..4} w_j * phi_j + b ) = sigma( w^T phi + b )
+                  (w, b fit by logistic regression on VALIDATION base-probs)
+
+DECISION THRESHOLD. The final binary prediction uses the probability threshold tau
+that maximizes F1 on the VALIDATION set (from its precision-recall curve):
+
+        tau   = argmax_t F1( y_val , 1[ P_stack^val >= t ] )
+        y_hat = 1[ P_stack >= tau ]
+
+
+================================================================================
+E. TRAINING & MODEL SELECTION (deep-network components)
+================================================================================
+DESCRIPTION.
+Both the transformer-fusion network and the neural components are trained with the
+same protocol (hp_search_transformer.py / stack_with_tuned_transformer.py).
+
+  Loss: binary cross-entropy on the logit z (nn.BCEWithLogitsLoss, p = sigma(z)):
+
+        L = -(1/N) * sum_i [ y_i * log(p_i) + (1 - y_i) * log(1 - p_i) ]
+
+  Class imbalance : a WeightedRandomSampler draws approximately class-balanced
+                    minibatches (the minority "death" class is oversampled).
+  Optimizer       : AdamW, learning rate 3e-4, weight decay 5e-3.
+  Regularization  : dropout p = 0.4; gradient-norm clipping at 5.0.
+  Batch size      : 64.
+  Epochs          : up to 120, with EARLY STOPPING on VALIDATION AUROC (patience
+                    15); the best-validation checkpoint is restored.
+  Seeds           : the network is trained with 5 independent random seeds; the
+                    REPORTED model is the BEST SEED by validation AUROC (best-of-5,
+                    not seed-averaging), matching how the ensemble is assembled.
+  Uncertainty     : test AUROC is reported with a 1000x PATIENT-level (grouped)
+                    bootstrap 95% CI.
+
+  LEAKAGE BARRIER (which split each component is fit on):
+     TRAIN       -> median imputation, standardization, mRMR selection, all
+                    neural-network weights, and classical-model tuning/refits.
+     VALIDATION  -> base-learner ranking / top-k selection, the stacking
+                    logistic-regression meta-learner, the decision threshold, plus
+                    early-stopping and best-seed selection.
+     TEST        -> untouched during fitting; used only to report AUROC / AUPRC /
+                    F1 / F2 / precision / recall (+ bootstrap CI).
+
+
+================================================================================
+F. EXACT HYPERPARAMETERS (quick reference)
+================================================================================
+  Sequence view      : 144 windows x 30 features (10-min windows; 5 stats x 6 channels)
+  Clinical view (DL) : 40 features (mRMR top-40)
+  Classical tabular  : 60 features (grouped mRMR: 20 machine + 40 clinical)
+  Transformer branch : d_model 64, layers 1, heads 4, FFN 128 (GELU), dropout 0.4,
+                       sinusoidal positional encoding, learnable [CLS], key-padding
+                       mask, post-layer-norm (nn.TransformerEncoderLayer)
+  Clinical MLP branch: Linear 40->64 -> BatchNorm1d -> ReLU -> Dropout(0.4)
+  Fusion head        : concat(128) -> Linear 128->64 -> ReLU -> Dropout(0.4) -> Linear 64->1
+  Classical pool     : GB, RF, LightGBM, XGBoost, LogReg; RandomizedSearchCV
+                       (StratifiedKFold, AUROC), 5-seed refit-and-average; top-3 by val AUROC
+  Optimizer/training : AdamW, lr 3e-4, weight decay 5e-3, grad clip 5.0, batch 64,
+                       <=120 epochs, early-stop patience 15, 5 seeds (best-val)
+  Meta-learner       : LogisticRegression(max_iter=5000) on [P_DL, P_1, P_2, P_3],
+                       fit on VALIDATION
+  Threshold          : max-F1 on VALIDATION
+
+  Final result (1-day, held-out test): AUROC 0.738.
+================================================================================

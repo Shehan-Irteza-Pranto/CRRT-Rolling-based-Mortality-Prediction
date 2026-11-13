@@ -1,0 +1,388 @@
+================================================================================
+CLINICAL_ONLY_MODELS — PIPELINE DOCUMENTATION
+================================================================================
+
+OVERVIEW
+--------
+This pipeline trains and evaluates machine learning models for in-hospital
+mortality prediction using clinical features only: daily lab values and PTI
+(Patient Trajectory Index) features including demographics and comorbidities.
+No machine pressure data is used.
+
+The folder contains two parallel sub-pipelines:
+  1. Root (per-day features)     — uses raw per-day clinical measurements
+  2. clinical_agg_day/           — uses cumulative-aggregated clinical features
+
+Both pipelines follow identical experimental structures.
+
+--------------------------------------------------------------------------------
+SECTION 1: FILES
+--------------------------------------------------------------------------------
+
+Root directory:
+  config.py               Central configuration (paths, hyperparameter grids)
+  run_experiments.py      Main orchestration script
+  pipeline_utils.py       Reusable utility functions
+  evaluate_day_by_day.py  Post-hoc per-day and cumulative AUROC evaluation
+  generate_report.py      Report generation (tables, plots, CSVs)
+
+clinical_agg_day/ subdirectory:
+  config.py               Configuration for aggregated-feature variant
+  prepare_data.py         Data preparation (creates cumulative-aggregated CSVs)
+  pipeline_utils.py       Utilities for aggregated pipeline
+  run_experiments.py      Orchestration for aggregated experiments
+  evaluate_day_by_day.py  Per-day evaluation for aggregated variant
+  generate_report.py      Report generation for aggregated variant
+
+--------------------------------------------------------------------------------
+SECTION 2: DATA & FEATURE DESCRIPTION
+--------------------------------------------------------------------------------
+
+Input data location:
+  Root pipeline:      Data/Processed/Model_Ready/clinical_only/{case}/
+  Aggregated pipeline: Data/Processed/Model_Ready/clinical_agg_day/{case}/
+
+Each case directory contains:  train.csv,  val.csv,  test.csv
+
+Cases:
+  1day  — predicts mortality within 1 day
+  2day  — predicts mortality within 2 days
+
+Target column: "label"  (binary: 0 = survived, 1 = died)
+
+Meta columns (excluded from features):
+  PID, Visit_no, Day, Mortality, days_until_death, label
+
+Feature sets by pipeline variant:
+
+  Root (per-day):
+    Lab features    : 23 laboratory measurements recorded per day
+    PTI features    : 112 demographic / comorbidity indicators
+    Total           : ~135 features per patient-day row
+
+  clinical_agg_day (cumulative-aggregated):
+    Lab features    : 23 labs × 4 aggregation stats = 92 features
+                      (mean, min, max, median of all days up to day D)
+    PTI features    : 112 (same, constant per patient)
+    Total           : 204 features per patient-day row
+
+  After mRMR feature selection:
+    Both pipelines  : 40 features selected
+
+--------------------------------------------------------------------------------
+SECTION 3: EXPERIMENT MATRIX
+--------------------------------------------------------------------------------
+
+  Cases             : 1day, 2day                        (2 options)
+  Training methods  : full_train, balanced_train         (2 options)
+  Feature sets      : mrmr                               (1 option)
+  Models            : KNN, LogisticRegression,           (8 options)
+                      DecisionTree, RandomForest,
+                      GradientBoosting, AdaBoost,
+                      LightGBM, XGBoost
+
+  Total experiments : 2 × 2 × 1 × 8 = 32 per pipeline
+
+--------------------------------------------------------------------------------
+SECTION 4: MODEL TRAINING PROCEDURE
+--------------------------------------------------------------------------------
+
+Each experiment follows these steps:
+
+STEP 1 — Load data
+  Load train.csv, val.csv, test.csv for the given case.
+  Extract feature columns (everything except META_COLS).
+  Convert to numpy arrays: X (float), y (binary int).
+
+STEP 2 — Imputation and scaling (fit on train only)
+  - Median imputation (SimpleImputer, strategy="median") for missing values.
+  - StandardScaler applied only to continuous columns.
+  - Binary PTI columns (values in {0, 1} only) are imputed but NOT scaled,
+    preserving their 0/1 interpretation.
+  - The fitted preprocessor is then applied to val and test sets.
+
+STEP 3 — Feature selection (mRMR, fit on train only)
+  - mRMR (Minimum Redundancy Maximum Relevance) selects top 40 features.
+  - mRMR balances relevance to the target against redundancy among features.
+  - Feature selection is fit on train, then applied to val and test.
+  - The selected feature names are recorded.
+
+STEP 4 — Class balancing (for balanced_train experiments only)
+  - Negatives are undersampled to match the number of positives (50/50 ratio).
+  - Undersampling uses np.random.RandomState(42) for reproducibility.
+  - full_train experiments skip this step; class imbalance is handled via
+    class_weight parameters in applicable models instead.
+
+STEP 5 — Hyperparameter tuning
+  - RandomizedSearchCV with:
+      n_iter      = min(30, grid_size)
+      cv          = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+      scoring     = "roc_auc"
+      n_jobs      = -1 (parallel)
+  - Tuning is performed on the (optionally balanced) training set only.
+  - The best hyperparameters and 5-fold CV AUROC are recorded.
+
+STEP 6 — Optimal threshold selection
+  - A temporary model is trained on the training set with the best params.
+  - The model predicts probabilities on the validation set.
+  - The threshold maximising F1-score on the validation set is chosen.
+  - This optimal threshold is stored alongside the final model.
+
+STEP 7 — Final model training
+  - Train and validation sets are combined into a single trainval set.
+  - If balanced_train: the combined set is also balanced (50/50).
+  - The final model is re-trained from scratch with the best hyperparameters
+    on this combined (optionally balanced) set.
+  - Training set size, positive count, and positive rate are recorded.
+
+STEP 8 — Serialisation
+  - The best model per case (highest full_test_AUROC) is saved as a .pkl file:
+      results/best_models/{case}_clinical_only_best_model.pkl
+  - The pickle contains: model, preprocessor tuple, feature names list,
+    optimal threshold, and a config metadata dict.
+
+--------------------------------------------------------------------------------
+SECTION 5: HYPERPARAMETER GRIDS
+--------------------------------------------------------------------------------
+
+Reproducibility seed: RANDOM_STATE = 42
+
+KNN
+  n_neighbors : [5, 11, 21]
+  weights     : ["uniform", "distance"]
+  metric      : ["euclidean", "manhattan"]
+
+DecisionTree
+  max_depth         : [None, 6, 10]
+  min_samples_split : [2, 10]
+  min_samples_leaf  : [1, 5]
+  class_weight      : [None, "balanced"]   (removed for balanced_train)
+
+RandomForest (RF)
+  n_estimators     : [200, 500]
+  max_depth        : [None, 10, 20]
+  min_samples_leaf : [1, 4]
+  max_features     : ["sqrt", "log2"]
+  class_weight     : [None, "balanced"]    (removed for balanced_train)
+
+GradientBoosting
+  n_estimators  : [200, 300]
+  max_depth     : [3, 5]
+  learning_rate : [0.05, 0.1]
+  subsample     : [0.8, 1.0]
+
+AdaBoost
+  n_estimators  : [100, 200]
+  learning_rate : [0.05, 0.1, 0.5]
+
+LightGBM
+  n_estimators      : [200, 300]
+  max_depth         : [-1, 8]
+  learning_rate     : [0.05, 0.001, 0.1]
+  num_leaves        : [31, 63]
+  min_child_samples : [20, 50]
+  class_weight      : [None, "balanced"]   (removed for balanced_train)
+
+XGBoost
+  n_estimators     : [200, 300]
+  max_depth        : [5, 7]
+  learning_rate    : [0.05, 0.1]
+  subsample        : [0.8, 1.0]
+  colsample_bytree : [0.8, 1.0]
+  scale_pos_weight : [1, 10]               (set to [1] for balanced_train)
+
+LogisticRegression
+  C            : [0.01, 0.1, 1, 10]
+  penalty      : ["l1", "l2"]
+  solver       : ["saga"]
+  max_iter     : [5000]
+  class_weight : [None, "balanced"]        (removed for balanced_train)
+
+--------------------------------------------------------------------------------
+SECTION 6: EVALUATION METHODS
+--------------------------------------------------------------------------------
+
+6.1  PRIMARY TEST SET EVALUATION (full test set)
+
+Two threshold variants are evaluated on the original (imbalanced) test set:
+
+  Threshold = 0.5 (default):
+    y_pred = (y_prob >= 0.5).astype(int)
+
+  Threshold = optimal (F1-maximising on val):
+    y_pred = (y_prob >= opt_threshold).astype(int)
+
+  Metrics computed for each threshold:
+    AUROC             — Area Under the ROC Curve (roc_auc_score)
+    AUPRC             — Area Under the Precision-Recall Curve
+                        (average_precision_score)
+    F1                — Binary F1 score
+    F1_macro          — Macro-averaged F1
+    F1_weighted       — Weighted F1
+    Precision         — Binary precision
+    Recall            — Binary recall (sensitivity)
+    Balanced_Accuracy — (Sensitivity + Specificity) / 2
+    TN, FP, FN, TP    — Confusion matrix elements
+    N_total           — Total test samples
+    N_positive        — Positive (died) test samples
+    N_negative        — Negative (survived) test samples
+
+  Result column prefixes:
+    full_test_        — threshold 0.5
+    full_test_opt_    — optimal threshold
+
+6.2  BALANCED TEST SET EVALUATION
+
+  The test set is undersampled (negatives reduced to match positives, 50/50).
+  The same two-threshold evaluation is repeated on this balanced subset.
+
+  Result column prefixes:
+    balanced_test_     — threshold 0.5
+    balanced_test_opt_ — optimal threshold
+
+6.3  DAY-BY-DAY AUROC
+
+  For each CRRT day D in {1, 2, ..., 14}:
+    - Filter test rows where Day == D.
+    - Compute AUROC using the predicted probabilities from the final model.
+    - AUROC is only computed if ≥ 2 positive samples exist for that day.
+    - Days with fewer than 2 positives are recorded as NaN.
+
+  Result column names:  day_1_AUROC, day_2_AUROC, ..., day_14_AUROC
+
+6.4  CUMULATIVE AUROC (evaluate_day_by_day.py)
+
+  For each cutoff day N in {1, 2, ..., 14}:
+    - Filter test rows where Day <= N (all days up to and including N).
+    - Compute AUROC on this cumulative subset.
+    - Used to assess how predictive ability grows as more days are available.
+
+6.5  SHAP FEATURE IMPORTANCE
+
+  Run after identifying the best model per case:
+    - Tree models (RF, GradientBoosting, AdaBoost, DecisionTree,
+                   LightGBM, XGBoost):
+        Uses shap.TreeExplainer(model)
+        Explains up to 300 test samples.
+    - KNN (kernel-based):
+        Uses shap.KernelExplainer with kmeans background (50 cluster centres)
+        Explains up to 100 test samples.
+
+  Processing:
+    - Handles multi-dimensional SHAP output (list, 2D, 3D arrays).
+    - Extracts class-1 (positive class) SHAP values.
+    - Computes mean |SHAP value| per feature.
+    - Ranks features, extracts top 10.
+
+  Outputs saved:
+    results/shap_plots/{title}_top10_bar.png      — horizontal bar chart
+    results/shap_plots/{title}_shap_summary.png   — SHAP summary (beeswarm)
+    results/shap_top10_features.json              — JSON dict of top-10 features
+
+6.6  CONFUSION MATRIX PLOTS
+
+  For the best model per case, 2×2 confusion matrix heatmaps are generated
+  for both the full test set and the balanced test set.
+
+  Saved to: results/confusion_matrices/
+
+--------------------------------------------------------------------------------
+SECTION 7: RESULTS & OUTPUT FILES
+--------------------------------------------------------------------------------
+
+results/raw_results.csv
+  One row per experiment (32 rows). Contains all metadata, hyperparameters,
+  and evaluation metrics. Checkpoint saved every 20 experiments.
+
+results/day_by_day_results.csv
+  Day-by-day AUROC columns extracted from raw_results for each experiment.
+
+results/best_models/{case}_clinical_only_best_model.pkl
+  Serialised best model per case. Contains model object, preprocessor,
+  feature names, optimal threshold, and config dict.
+
+results/shap_top10_features.json
+  Top-10 features by mean absolute SHAP value for the best model per case.
+
+results/shap_plots/
+  SHAP bar plots and summary plots for best models.
+
+results/confusion_matrices/
+  2×2 confusion matrix PNG files for best models on full and balanced test sets.
+
+results/experiment_log.txt
+  Full execution log with timestamps and per-experiment results.
+
+results/reports/
+  CSV summaries:
+    full_summary.csv              — max metrics per (case, method, fs, model)
+    best_per_training_method.csv  — best model per (case, training_method)
+    best_overall.csv              — single best model per case
+    all_results_ranked.csv        — all experiments ranked by full_test_AUROC
+    shap_top10_features.csv       — tabular SHAP feature importance
+
+  PNG plots:
+    heatmap_{metric}.png                    — model × case heatmaps
+    {case}_training_method_comparison.png   — full_train vs balanced_train bars
+    {case}_feature_selection.png            — feature selection comparison bars
+    1day_vs_2day_comparison.png             — 1day vs 2day comparison bars
+    {case}_radar_top5.png                   — radar chart, top-5 models
+    {case}_day_by_day_all_models.png        — per-day AUROC, all models
+    {case}_day_by_day_top3.png              — per-day AUROC, top-3 highlighted
+    {case}_clinical_only_day_by_day_auroc.png   — best-model per-day AUROC
+    {case}_clinical_only_cumulative_auroc.png   — cumulative AUROC
+    clinical_only_1day_vs_2day_day_auroc.png    — 1day vs 2day per-day overlay
+    clinical_only_1day_vs_2day_cumulative_auroc.png — cumulative overlay
+
+--------------------------------------------------------------------------------
+SECTION 8: EXECUTION WORKFLOW (END-TO-END)
+--------------------------------------------------------------------------------
+
+  STEP 1  (Aggregated variant only)
+    cd clinical_agg_day/
+    python prepare_data.py
+    Creates cumulative-aggregated train/val/test CSVs.
+
+  STEP 2  Run all experiments
+    python run_experiments.py [--cases 1day 2day] [--resume] [--skip-shap]
+    Produces raw_results.csv, best .pkl models, SHAP plots, CM plots.
+
+  STEP 3  Post-hoc day-by-day evaluation
+    python evaluate_day_by_day.py
+    Loads best models, generates per-day and cumulative AUROC plots and CSVs.
+
+  STEP 4  Generate full report
+    python generate_report.py [--csv results/raw_results.csv]
+    Generates all tables, ranked CSVs, and visualisation plots.
+
+--------------------------------------------------------------------------------
+SECTION 9: KEY CONFIGURATION CONSTANTS
+--------------------------------------------------------------------------------
+
+  RANDOM_STATE         = 42      (reproducibility seed throughout)
+  CV_FOLDS             = 5       (StratifiedKFold folds)
+  RANDOMIZED_SEARCH_ITER = 30    (max hyperparameter samples)
+  SCORING              = "roc_auc"
+  N_FEATURES_SELECT    = 40      (mRMR top-k)
+  MIN_POS              = 2       (minimum positives to compute day AUROC)
+
+--------------------------------------------------------------------------------
+SECTION 10: DIFFERENCES — ROOT vs clinical_agg_day
+--------------------------------------------------------------------------------
+
+  Aspect                  Root (per-day)          clinical_agg_day
+  ----------------------  ----------------------  -------------------------
+  Lab features            23 per-day values       23 × 4 stats = 92 features
+  Lab aggregation         None                    mean, min, max, median
+                                                  across days 1..D
+  Machine features        None                    None
+  PTI features            112 (unchanged)         112 (unchanged)
+  Total feature count     ~135                    204
+  After mRMR selection    40                      40
+  Extra data prep step    No                      Yes (prepare_data.py)
+  PKL suffix              clinical_only           clinical_agg_day
+  Total experiments       32                      32
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
